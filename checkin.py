@@ -13,6 +13,7 @@ from urllib.parse import urlparse, urlencode
 
 from curl_cffi import requests as curl_requests
 from camoufox.async_api import AsyncCamoufox
+from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 from utils.config import AccountConfig, ProviderConfig
 from utils.browser_utils import parse_cookies, filter_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
 from utils.get_cf_clearance import get_cf_clearance
@@ -501,85 +502,134 @@ class CheckIn:
         self,
         session: curl_requests.Session,
         headers: dict,
+        oauth_provider: str = "github",
     ) -> dict:
         """获取认证状态
-        
+
         使用 curl_cffi Session 发送请求。Session 可在创建时设置全局 impersonate。
-        
+
+        兼容新旧两版 new-api：
+        - 旧版: GET /api/oauth/state，返回 {"success": true, "data": "<state>"}
+        - 新版: POST /api/oauth/state，body {"provider": "...", "intent": "login"}，
+          返回 {"success": true, "data": {"flow_token": "<state>", "expires_at": ...}}
+          （旧版 GET 在新版会被 /oauth/:provider 通配路由拦截返回 400）
+
         Args:
             session: curl_cffi Session 客户端（已包含 cookies，可能已设置 impersonate）
             headers: 请求头
+            oauth_provider: OAuth 提供商标识（github / linuxdo 等）
         """
+        auth_state_url = self.provider_config.get_auth_state_url()
+
+        # 优先使用旧版 GET 接口
+        result = self._request_auth_state(session, headers, auth_state_url, oauth_provider)
+        if result.get("success"):
+            return result
+
+        # 回退到新版 POST 接口
+        print(f"ℹ️ {self.account_name}: GET auth state failed, trying new POST endpoint")
+        post_headers = headers.copy()
+        post_headers["Content-Type"] = "application/json"
+        post_result = self._request_auth_state(
+            session,
+            post_headers,
+            auth_state_url,
+            oauth_provider,
+            json_body={"provider": oauth_provider, "intent": "login"},
+        )
+        if post_result.get("success"):
+            print(f"ℹ️ {self.account_name}: Got auth state via POST (new new-api OAuth flow)")
+            return post_result
+
+        return result
+
+    def _request_auth_state(
+        self,
+        session: curl_requests.Session,
+        headers: dict,
+        auth_state_url: str,
+        oauth_provider: str,
+        json_body: dict | None = None,
+    ) -> dict:
+        """请求认证状态接口并解析新旧两种响应格式"""
         try:
-            response = session.get(
-                self.provider_config.get_auth_state_url(),
-                headers=headers,
-                timeout=30,
-            )
+            if json_body is None:
+                response = session.get(auth_state_url, headers=headers, timeout=30)
+            else:
+                response = session.post(auth_state_url, headers=headers, json=json_body, timeout=30)
 
-            if response.status_code == 200:
-                json_data = response_resolve(response, "get_auth_state", self.account_name)
-                if json_data is None:
-                    return {
-                        "success": False,
-                        "error": "Failed to get auth state: Invalid response type (saved to logs)",
-                    }
+            if response.status_code != 200:
+                return {
+                    "success": False,
+                    "error": f"Failed to get auth state: HTTP {response.status_code}",
+                }
 
-                # 检查响应是否成功
-                if json_data.get("success"):
-                    auth_data = json_data.get("data")
+            json_data = response_resolve(response, "get_auth_state", self.account_name)
+            if json_data is None:
+                return {
+                    "success": False,
+                    "error": "Failed to get auth state: Invalid response type (saved to logs)",
+                }
 
-                    # 将 curl_cffi Cookies 转换为 Camoufox 格式
-                    result_cookies = []
-                    parsed_domain = urlparse(self.provider_config.origin).netloc
+            # 检查响应是否成功
+            if not json_data.get("success"):
+                error_msg = json_data.get("message", "Unknown error")
+                return {
+                    "success": False,
+                    "error": f"Failed to get auth state: {error_msg}",
+                }
 
-                    print(f"ℹ️ {self.account_name}: Got {len(response.cookies)} cookies from auth state request")
-                    for cookie in response.cookies.jar:
-                        # 从 _rest 中获取 HttpOnly 和 SameSite，确保类型正确
-                        http_only_raw = cookie._rest.get("HttpOnly", False)
-                        http_only = bool(http_only_raw) if http_only_raw is not None else False
-                        
-                        same_site_raw = cookie._rest.get("SameSite", "Lax")
-                        same_site = str(same_site_raw) if same_site_raw else "Lax"
-                        
-                        # secure 也需要确保是布尔值
-                        secure = bool(cookie.secure) if cookie.secure is not None else False
-                        
-                        print(
-                            f"  📚 Cookie: {cookie.name} (Domain: {cookie.domain}, "
-                            f"Path: {cookie.path}, Expires: {cookie.expires}, "
-                            f"HttpOnly: {http_only}, Secure: {secure}, "
-                            f"SameSite: {same_site})"
-                        )
-                        # 构建 cookie 字典，Camoufox 要求字段类型严格
-                        cookie_dict = {
-                            "name": cookie.name,
-                            "domain": cookie.domain if cookie.domain else parsed_domain,
-                            "value": cookie.value,
-                            "path": cookie.path if cookie.path else "/",
-                            "secure": secure,
-                            "httpOnly": http_only,
-                            "sameSite": same_site,
-                        }
-                        # 只有当 expires 是有效的数值时才添加
-                        if cookie.expires is not None:
-                            cookie_dict["expires"] = float(cookie.expires)
-                        result_cookies.append(cookie_dict)
+            auth_data = json_data.get("data")
+            # 新版返回 {"flow_token": "...", "expires_at": ...}，旧版直接返回状态字符串
+            if isinstance(auth_data, dict):
+                auth_data = auth_data.get("flow_token")
+            if not auth_data:
+                return {
+                    "success": False,
+                    "error": "Failed to get auth state: state is empty",
+                }
 
-                    return {
-                        "success": True,
-                        "state": auth_data,
-                        "cookies": result_cookies,
-                    }
-                else:
-                    error_msg = json_data.get("message", "Unknown error")
-                    return {
-                        "success": False,
-                        "error": f"Failed to get auth state: {error_msg}",
-                    }
+            # 将 curl_cffi Cookies 转换为 Camoufox 格式
+            result_cookies = []
+            parsed_domain = urlparse(self.provider_config.origin).netloc
+
+            print(f"ℹ️ {self.account_name}: Got {len(response.cookies)} cookies from auth state request")
+            for cookie in response.cookies.jar:
+                # 从 _rest 中获取 HttpOnly 和 SameSite，确保类型正确
+                http_only_raw = cookie._rest.get("HttpOnly", False)
+                http_only = bool(http_only_raw) if http_only_raw is not None else False
+
+                same_site_raw = cookie._rest.get("SameSite", "Lax")
+                same_site = str(same_site_raw) if same_site_raw else "Lax"
+
+                # secure 也需要确保是布尔值
+                secure = bool(cookie.secure) if cookie.secure is not None else False
+
+                print(
+                    f"  📚 Cookie: {cookie.name} (Domain: {cookie.domain}, "
+                    f"Path: {cookie.path}, Expires: {cookie.expires}, "
+                    f"HttpOnly: {http_only}, Secure: {secure}, "
+                    f"SameSite: {same_site})"
+                )
+                # 构建 cookie 字典，Camoufox 要求字段类型严格
+                cookie_dict = {
+                    "name": cookie.name,
+                    "domain": cookie.domain if cookie.domain else parsed_domain,
+                    "value": cookie.value,
+                    "path": cookie.path if cookie.path else "/",
+                    "secure": secure,
+                    "httpOnly": http_only,
+                    "sameSite": same_site,
+                }
+                # 只有当 expires 是有效的数值时才添加
+                if cookie.expires is not None:
+                    cookie_dict["expires"] = float(cookie.expires)
+                result_cookies.append(cookie_dict)
+
             return {
-                "success": False,
-                "error": f"Failed to get auth state: HTTP {response.status_code}",
+                "success": True,
+                "state": auth_data,
+                "cookies": result_cookies,
             }
         except Exception as e:
             return {
@@ -725,14 +775,160 @@ class CheckIn:
                 "error": f"Failed to get user info, {e}",
             }
 
+    async def get_turnstile_site_key(self, session: curl_requests.Session, headers: dict) -> str | None:
+        """从站点 /api/status 查询 Turnstile site key（未启用或查询失败返回 None）"""
+        try:
+            response = session.get(self.provider_config.get_status_url(), headers=headers, timeout=30)
+            if response.status_code != 200:
+                return None
+            json_data = response_resolve(response, "get_turnstile_config", self.account_name)
+            if not json_data or not json_data.get("success"):
+                return None
+            status_data = json_data.get("data") or {}
+            if not status_data.get("turnstile_check"):
+                return None
+            return status_data.get("turnstile_site_key") or None
+        except Exception:
+            return None
+
+    async def solve_turnstile_with_browser(self, site_key: str) -> str | None:
+        """使用 Camoufox 在站点页面上渲染并解决 Turnstile 验证，返回 token
+
+        优先等待组件自动通过（托管模式），失败后尝试点击复选框。
+        注意：Turnstile token 与客户端 IP 绑定且一次性有效，需尽快使用。
+        """
+        print(f"ℹ️ {self.account_name}: Solving Turnstile captcha in browser")
+        with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_turnstile_") as tmp_dir:
+            async with AsyncCamoufox(
+                user_data_dir=tmp_dir,
+                persistent_context=True,
+                headless=False,
+                humanize=True,
+                locale="en-US",
+                geoip=True if self.camoufox_proxy_config else False,
+                proxy=self.camoufox_proxy_config,
+                os="macos",  # 强制使用 macOS 指纹，避免跨平台指纹不一致问题
+            ) as browser:
+                page = await browser.new_page()
+                try:
+                    # 组件需渲染在与 site key 同域的页面上
+                    await page.goto(self.provider_config.origin, wait_until="domcontentloaded")
+                    try:
+                        await page.wait_for_function('document.readyState === "complete"', timeout=10000)
+                    except Exception:
+                        await page.wait_for_timeout(3000)
+
+                    # 注入 Turnstile 组件（显式渲染），token 通过回调写入 window
+                    await page.evaluate(
+                        """(siteKey) => {
+                            window.__cfTurnstileToken = null;
+                            window.__cfTurnstileError = false;
+                            const script = document.createElement('script');
+                            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+                            script.onload = () => {
+                                const container = document.createElement('div');
+                                document.body.appendChild(container);
+                                turnstile.render(container, {
+                                    sitekey: siteKey,
+                                    callback: (token) => { window.__cfTurnstileToken = token; },
+                                    'error-callback': () => { window.__cfTurnstileError = true; },
+                                    'timeout-callback': () => { window.__cfTurnstileError = true; },
+                                });
+                            };
+                            document.head.appendChild(script);
+                        }""",
+                        site_key,
+                    )
+
+                    async def _read_token() -> str | None:
+                        # 回调写入的 token，或组件隐藏 input 中的值
+                        return await page.evaluate(
+                            """() => {
+                                if (window.__cfTurnstileToken) return window.__cfTurnstileToken;
+                                const el = document.querySelector('[name="cf-turnstile-response"]');
+                                return el && el.value ? el.value : null;
+                            }"""
+                        )
+
+                    # 1. 等待自动通过（托管模式大多数情况下无需交互）
+                    for _ in range(10):
+                        await page.wait_for_timeout(2000)
+                        token = await _read_token()
+                        if token:
+                            print(f"✅ {self.account_name}: Got Turnstile token (auto-solved)")
+                            return token
+                        errored = await page.evaluate("() => window.__cfTurnstileError")
+                        if errored:
+                            break
+
+                    # 2. 自动通过失败，尝试点击复选框求解
+                    print(f"ℹ️ {self.account_name}: Turnstile auto-solve failed, trying click solver")
+                    async with ClickSolver(
+                        framework=FrameworkType.CAMOUFOX, page=page, max_attempts=3, attempt_delay=3
+                    ) as solver:
+                        try:
+                            await solver.solve_captcha(captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE)
+                        except Exception as solve_err:
+                            print(f"⚠️ {self.account_name}: Turnstile click solver failed: {solve_err}")
+
+                    for _ in range(8):
+                        await page.wait_for_timeout(2000)
+                        token = await _read_token()
+                        if token:
+                            print(f"✅ {self.account_name}: Got Turnstile token (click-solved)")
+                            return token
+
+                    print(f"❌ {self.account_name}: Failed to obtain Turnstile token")
+                    return None
+                except Exception as e:
+                    print(f"❌ {self.account_name}: Error solving Turnstile: {e}")
+                    await take_screenshot(page, "turnstile_solve_error", self.account_name)
+                    return None
+                finally:
+                    await page.close()
+
+    async def retry_check_in_with_turnstile(
+        self,
+        session: curl_requests.Session,
+        headers: dict,
+        api_user: str | int,
+        check_in_result: dict,
+    ) -> dict:
+        """签到失败且提示需要 Turnstile 时，解题后重试一次"""
+        error_text = f"{check_in_result.get('error', '')} {check_in_result.get('message', '')}"
+        if "turnstile" not in error_text.lower():
+            return check_in_result
+
+        print(f"ℹ️ {self.account_name}: Check-in requires Turnstile verification")
+        site_key = await self.get_turnstile_site_key(session, headers)
+        if not site_key:
+            print(f"⚠️ {self.account_name}: Turnstile enabled but site key not found, cannot check in")
+            return {
+                "success": False,
+                "error": "Turnstile required but site key unavailable",
+            }
+
+        token = await self.solve_turnstile_with_browser(site_key)
+        if not token:
+            return {"success": False, "error": "Failed to solve Turnstile captcha"}
+
+        return self.execute_check_in(session, headers, api_user, turnstile_token=token)
+
     def execute_check_in(
         self,
         session: curl_requests.Session,
         headers: dict,
         api_user: str | int,
+        turnstile_token: str | None = None,
     ) -> dict:
         """执行签到请求
-        
+
+        Args:
+            session: curl_cffi Session 客户端
+            headers: 请求头
+            api_user: API 用户 ID
+            turnstile_token: Turnstile 验证 token（站点启用 Turnstile 时必须）
+
         Returns:
             包含 success, message, data 等信息的字典
         """
@@ -745,6 +941,11 @@ class CheckIn:
         if not check_in_url:
             print(f"❌ {self.account_name}: No check-in URL configured")
             return {"success": False, "error": "No check-in URL configured"}
+
+        if turnstile_token:
+            # 站点启用 Turnstile 时，token 通过查询参数传递
+            separator = "&" if "?" in check_in_url else "?"
+            check_in_url = f"{check_in_url}{separator}turnstile={turnstile_token}"
 
         response = session.post(check_in_url, headers=checkin_headers, timeout=30)
 
@@ -986,6 +1187,11 @@ class CheckIn:
                         # 未签到，执行签到
                         check_in_result = self.execute_check_in(session, headers, api_user)
                         if not check_in_result.get("success"):
+                            # 失败原因若是需要 Turnstile 验证，则解题后重试
+                            check_in_result = await self.retry_check_in_with_turnstile(
+                                session, headers, api_user, check_in_result
+                            )
+                        if not check_in_result.get("success"):
                             return False, {"error": check_in_result.get("error", "Check-in failed")}
                         # 签到成功后再次查询状态（显示最新状态）
                         check_in_status_func(
@@ -997,6 +1203,11 @@ class CheckIn:
                 else:
                     # 没有配置签到状态查询函数，直接执行签到
                     check_in_result = self.execute_check_in(session, headers, api_user)
+                    if not check_in_result.get("success"):
+                        # 失败原因若是需要 Turnstile 验证，则解题后重试
+                        check_in_result = await self.retry_check_in_with_turnstile(
+                            session, headers, api_user, check_in_result
+                        )
                     if not check_in_result.get("success"):
                         return False, {"error": check_in_result.get("error", "Check-in failed")}
             else:
@@ -1090,6 +1301,11 @@ class CheckIn:
                         # 未签到，执行签到
                         check_in_result = self.execute_check_in(session, headers, api_user)
                         if not check_in_result.get("success"):
+                            # 失败原因若是需要 Turnstile 验证，则解题后重试
+                            check_in_result = await self.retry_check_in_with_turnstile(
+                                session, headers, api_user, check_in_result
+                            )
+                        if not check_in_result.get("success"):
                             return False, {"error": check_in_result.get("error", "Check-in failed")}
                         # 签到成功后再次查询状态（显示最新状态）
                         check_in_status_func(
@@ -1101,6 +1317,11 @@ class CheckIn:
                 else:
                     # 没有配置签到状态查询函数，直接执行签到
                     check_in_result = self.execute_check_in(session, headers, api_user)
+                    if not check_in_result.get("success"):
+                        # 失败原因若是需要 Turnstile 验证，则解题后重试
+                        check_in_result = await self.retry_check_in_with_turnstile(
+                            session, headers, api_user, check_in_result
+                        )
                     if not check_in_result.get("success"):
                         return False, {"error": check_in_result.get("error", "Check-in failed")}
             else:
@@ -1195,6 +1416,7 @@ class CheckIn:
             auth_state_result = await self.get_auth_state(
                 session=session,
                 headers=headers,
+                oauth_provider="github",
             )
             if auth_state_result and auth_state_result.get("success"):
                 print(f"ℹ️ {self.account_name}: Got auth state for GitHub: {auth_state_result['state']}")
@@ -1263,12 +1485,22 @@ class CheckIn:
                         json_data = response_resolve(response, "github_oauth_callback", self.account_name)
                         if json_data and json_data.get("success"):
                             user_data = json_data.get("data", {})
-                            api_user = user_data.get("id")
+                            # 兼容新版 new-api：data.user 为用户对象，data.access_token 为访问令牌
+                            oauth_user = user_data.get("user") if isinstance(user_data.get("user"), dict) else {}
+                            api_user = user_data.get("id") or oauth_user.get("id")
+                            access_token = user_data.get("access_token")
 
                             if api_user:
                                 print(f"✅ {self.account_name}: Got api_user from callback: {api_user}")
 
-                                # 提取 cookies
+                                if access_token:
+                                    # 新版 new-api 面板接口仅接受 Bearer 访问令牌，cookie 不再可用
+                                    print(f"ℹ️ {self.account_name}: Using access token from OAuth callback (new new-api auth)")
+                                    return await self.check_in_with_system_access_token(
+                                        access_token, bypass_cookies, updated_headers, api_user
+                                    )
+
+                                # 旧版 new-api：提取 cookies 走 cookie 签到
                                 user_cookies = {}
                                 for cookie in response.cookies.jar:
                                     user_cookies[cookie.name] = cookie.value
@@ -1358,6 +1590,7 @@ class CheckIn:
             auth_state_result = await self.get_auth_state(
                 session=session,
                 headers=headers,
+                oauth_provider="linuxdo",
             )
             if auth_state_result and auth_state_result.get("success"):
                 print(f"ℹ️ {self.account_name}: Got auth state for Linux.do: {auth_state_result['state']}")
@@ -1426,12 +1659,22 @@ class CheckIn:
                         json_data = response_resolve(response, "linuxdo_oauth_callback", self.account_name)
                         if json_data and json_data.get("success"):
                             user_data = json_data.get("data", {})
-                            api_user = user_data.get("id")
+                            # 兼容新版 new-api：data.user 为用户对象，data.access_token 为访问令牌
+                            oauth_user = user_data.get("user") if isinstance(user_data.get("user"), dict) else {}
+                            api_user = user_data.get("id") or oauth_user.get("id")
+                            access_token = user_data.get("access_token")
 
                             if api_user:
                                 print(f"✅ {self.account_name}: Got api_user from callback: {api_user}")
 
-                                # 提取 cookies
+                                if access_token:
+                                    # 新版 new-api 面板接口仅接受 Bearer 访问令牌，cookie 不再可用
+                                    print(f"ℹ️ {self.account_name}: Using access token from OAuth callback (new new-api auth)")
+                                    return await self.check_in_with_system_access_token(
+                                        access_token, bypass_cookies, updated_headers, api_user
+                                    )
+
+                                # 旧版 new-api：提取 cookies 走 cookie 签到
                                 user_cookies = {}
                                 for cookie in response.cookies.jar:
                                     user_cookies[cookie.name] = cookie.value

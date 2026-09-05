@@ -92,6 +92,24 @@ class GitHubSignIn:
 
             context = await browser.new_context(storage_state=storage_state)
 
+            # 拦截 OAuth 回调页面：新版 new-api 的 flow token 一次性有效，
+            # 站点前端回调页会先兑换 code 导致脚本无法再调用回调接口，
+            # 这里用本地 stub 响应代替真实页面，把 code/state 留给脚本自身
+            callback_pattern = self.provider_config.get_github_auth_redirect_pattern()
+            callback_captured = {"hit": False, "url": ""}
+
+            async def _fulfill_callback(route):
+                callback_captured["hit"] = True
+                callback_captured["url"] = route.request.url
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body="<html><body>OAuth callback captured by check-in script</body></html>",
+                )
+
+            await context.route(callback_pattern, _fulfill_callback)
+            print(f"ℹ️ {self.account_name}: Intercepting OAuth callback pages matching {callback_pattern}")
+
             # 设置从 auth_state 获取的 session cookies 到页面上下文
             if auth_cookies:
                 await context.add_cookies(auth_cookies)
@@ -323,6 +341,24 @@ class GitHubSignIn:
                     # 从 localStorage 获取 user 对象并提取 id
                     api_user = None
                     current_url = page.url
+
+                    if callback_captured["hit"]:
+                        # 回调页面被本地拦截（新版 new-api 的 flow token 一次性有效），
+                        # 站点前端不会执行，localStorage 中不会有 user，
+                        # 直接把 code/state 返回给上层调用回调接口
+                        print(
+                            f"ℹ️ {self.account_name}: OAuth callback intercepted locally, "
+                            f"returning code/state: {callback_captured['url']}"
+                        )
+                        callback_url = callback_captured["url"] or current_url
+                        parsed_url = urlparse(callback_url)
+                        query_params = parse_qs(parsed_url.query)
+                        if "code" in query_params:
+                            return True, query_params, None
+                        print(f"❌ {self.account_name}: Captured callback URL without code: {callback_url}")
+                        await take_screenshot(page, "github_oauth_callback_no_code", self.account_name)
+                        return False, {"error": "GitHub OAuth callback captured without code"}, None
+
                     try:
                         try:
                             await page.wait_for_function('localStorage.getItem("user") !== null', timeout=10000)
