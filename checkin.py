@@ -8,6 +8,7 @@ import json
 import inspect
 import hashlib
 import os
+import re
 import tempfile
 from urllib.parse import urlparse, urlencode
 
@@ -818,24 +819,43 @@ class CheckIn:
                     except Exception:
                         await page.wait_for_timeout(3000)
 
-                    # 注入 Turnstile 组件（显式渲染），token 通过回调写入 window
+                    # 注入 api.js 并等待其全局对象就绪（api.js 为异步引导，
+                    # onload 时 window.turnstile 未必可用，需要轮询）
+                    await page.evaluate(
+                        """() => {
+                            if (!document.getElementById('cf-turnstile-script')) {
+                                const script = document.createElement('script');
+                                script.id = 'cf-turnstile-script';
+                                script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+                                document.head.appendChild(script);
+                            }
+                        }"""
+                    )
+                    turnstile_ready = False
+                    for _ in range(15):
+                        turnstile_ready = await page.evaluate(
+                            "() => typeof window.turnstile !== 'undefined' && typeof window.turnstile.render === 'function'"
+                        )
+                        if turnstile_ready:
+                            break
+                        await page.wait_for_timeout(2000)
+                    if not turnstile_ready:
+                        print(f"⚠️ {self.account_name}: Turnstile api.js failed to initialize")
+                        return None
+
+                    # 渲染 Turnstile 组件（显式渲染），token 通过回调写入 window
                     await page.evaluate(
                         """(siteKey) => {
                             window.__cfTurnstileToken = null;
                             window.__cfTurnstileError = false;
-                            const script = document.createElement('script');
-                            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-                            script.onload = () => {
-                                const container = document.createElement('div');
-                                document.body.appendChild(container);
-                                turnstile.render(container, {
-                                    sitekey: siteKey,
-                                    callback: (token) => { window.__cfTurnstileToken = token; },
-                                    'error-callback': () => { window.__cfTurnstileError = true; },
-                                    'timeout-callback': () => { window.__cfTurnstileError = true; },
-                                });
-                            };
-                            document.head.appendChild(script);
+                            const container = document.createElement('div');
+                            document.body.appendChild(container);
+                            window.turnstile.render(container, {
+                                sitekey: siteKey,
+                                callback: (token) => { window.__cfTurnstileToken = token; },
+                                'error-callback': (e) => { window.__cfTurnstileError = 'error:' + String(e); },
+                                'timeout-callback': () => { window.__cfTurnstileError = 'timeout'; },
+                            });
                         }""",
                         site_key,
                     )
@@ -887,6 +907,69 @@ class CheckIn:
                 finally:
                     await page.close()
 
+    async def check_in_via_site_ui(
+        self,
+        site_cookies: list[dict],
+        session: curl_requests.Session,
+        headers: dict,
+    ) -> bool:
+        """在浏览器中恢复站点会话后点击页面上的签到按钮
+
+        站点前端会自行处理 Turnstile 验证弹窗，绕开脚本直接调 API 时
+        无法通过验证的问题。返回签到是否成功（以状态接口确认为准）。
+        """
+        print(f"ℹ️ {self.account_name}: Trying check-in via site UI")
+        status_func = self.provider_config.get_check_in_status_func()
+
+        with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_ui_") as tmp_dir:
+            async with AsyncCamoufox(
+                user_data_dir=tmp_dir,
+                persistent_context=True,
+                headless=False,
+                humanize=True,
+                locale="en-US",
+                geoip=True if self.camoufox_proxy_config else False,
+                proxy=self.camoufox_proxy_config,
+                os="macos",
+            ) as browser:
+                page = await browser.new_page()
+                try:
+                    await page.context.add_cookies(site_cookies)
+                    await page.goto(
+                        f"{self.provider_config.origin}/dashboard/overview",
+                        wait_until="domcontentloaded",
+                    )
+                    await page.wait_for_timeout(6000)
+
+                    # 查找签到按钮（多语言匹配）
+                    button = page.get_by_role("button", name=re.compile(r"立即签到|Check in now", re.I))
+                    if (await button.count()) < 1:
+                        print(f"⚠️ {self.account_name}: Check-in button not found on dashboard")
+                        return False
+                    await button.first.click()
+                    print(f"ℹ️ {self.account_name}: Clicked check-in button, waiting for result")
+
+                    # 轮询状态接口确认签到成功（SPA 内部处理 Turnstile，可能需要较长时间）
+                    for _ in range(45):
+                        await page.wait_for_timeout(2000)
+                        if not status_func:
+                            return True
+                        checked = status_func(
+                            provider_config=self.provider_config,
+                            account_config=self.account_config,
+                            cookies=session.cookies.get_dict(),
+                            headers=headers,
+                        )
+                        if checked:
+                            print(f"✅ {self.account_name}: Check-in via site UI succeeded")
+                            return True
+                    return False
+                except Exception as e:
+                    print(f"❌ {self.account_name}: Site UI check-in error: {e}")
+                    return False
+                finally:
+                    await page.close()
+
     async def retry_check_in_with_turnstile(
         self,
         session: curl_requests.Session,
@@ -894,25 +977,36 @@ class CheckIn:
         api_user: str | int,
         check_in_result: dict,
     ) -> dict:
-        """签到失败且提示需要 Turnstile 时，解题后重试一次"""
+        """签到失败且提示需要 Turnstile 时，解题后重试
+
+        依次尝试：
+        1. 浏览器渲染 Turnstile 组件获取 token 后重试 POST
+        2. 恢复站点会话后点击页面签到按钮（SPA 内部处理验证）
+        """
         error_text = f"{check_in_result.get('error', '')} {check_in_result.get('message', '')}"
         if "turnstile" not in error_text.lower():
             return check_in_result
 
         print(f"ℹ️ {self.account_name}: Check-in requires Turnstile verification")
         site_key = await self.get_turnstile_site_key(session, headers)
-        if not site_key:
-            print(f"⚠️ {self.account_name}: Turnstile enabled but site key not found, cannot check in")
-            return {
-                "success": False,
-                "error": "Turnstile required but site key unavailable",
-            }
+        original_error = check_in_result.get("error", "Check-in failed")
 
-        token = await self.solve_turnstile_with_browser(site_key)
-        if not token:
-            return {"success": False, "error": "Failed to solve Turnstile captcha"}
+        if site_key:
+            token = await self.solve_turnstile_with_browser(site_key)
+            if token:
+                result = self.execute_check_in(session, headers, api_user, turnstile_token=token)
+                if result.get("success"):
+                    return result
+                print(f"⚠️ {self.account_name}: Check-in POST with token still failed: {result.get('error')}")
+        else:
+            print(f"⚠️ {self.account_name}: Turnstile enabled but site key not found")
 
-        return self.execute_check_in(session, headers, api_user, turnstile_token=token)
+        # 兜底：站点 UI 内点击签到
+        site_cookies = getattr(self, "_oauth_site_cookies", None)
+        if site_cookies and await self.check_in_via_site_ui(site_cookies, session, headers):
+            return {"success": True, "message": "Check-in successful (via site UI)"}
+
+        return {"success": False, "error": original_error or "Turnstile captcha solve failed"}
 
     def execute_check_in(
         self,
@@ -1450,6 +1544,8 @@ class CheckIn:
                 # 新版 new-api：浏览器内 OAuth 兑换成功，直接使用 access_token 签到
                 api_user = result_data["api_user"]
                 access_token = result_data["access_token"]
+                # 保存站点会话 cookies（含 refresh cookie），供 Turnstile 兜底的站点 UI 流程恢复会话
+                self._oauth_site_cookies = result_data.get("raw_cookies") or []
 
                 # 如果 OAuth 登录返回了 browser_headers，用它更新 common_headers
                 updated_headers = common_headers.copy()

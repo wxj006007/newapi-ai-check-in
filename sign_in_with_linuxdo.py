@@ -365,7 +365,19 @@ class LinuxDoSignIn:
                             f"(api_user: {api_user})"
                         )
                         user_cookies = filter_cookies(await context.cookies(), self.provider_config.origin)
-                        return True, {"access_token": access_token, "api_user": api_user, "cookies": user_cookies}, None
+                        # 原始 cookie（含 domain 等字段），供站点 UI 兜底流程恢复会话
+                        domain_suffix = urlparse(self.provider_config.origin).netloc.lstrip(".")
+                        raw_site_cookies = [
+                            c for c in await context.cookies()
+                            if (c.get("domain") or "").lstrip(".") == domain_suffix
+                            or (c.get("domain") or "").lstrip(".").endswith("." + domain_suffix)
+                        ]
+                        return True, {
+                            "access_token": access_token,
+                            "api_user": api_user,
+                            "cookies": user_cookies,
+                            "raw_cookies": raw_site_cookies,
+                        }, None
 
                     if oauth_bundles:
                         print(
