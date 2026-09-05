@@ -849,6 +849,7 @@ class CheckIn:
                             window.__cfTurnstileToken = null;
                             window.__cfTurnstileError = false;
                             const container = document.createElement('div');
+                            container.id = 'cf-ts-injected-container';
                             document.body.appendChild(container);
                             window.turnstile.render(container, {
                                 sitekey: siteKey,
@@ -861,11 +862,14 @@ class CheckIn:
                     )
 
                     async def _read_token() -> str | None:
-                        # 回调写入的 token，或组件隐藏 input 中的值
+                        # 优先读回调写入的 token，其次读本容器内的隐藏 input
+                        # （页面上可能存在站点自己的 Turnstile 组件，不能混淆）
                         return await page.evaluate(
                             """() => {
                                 if (window.__cfTurnstileToken) return window.__cfTurnstileToken;
-                                const el = document.querySelector('[name="cf-turnstile-response"]');
+                                const el = document.querySelector(
+                                    '#cf-ts-injected-container [name="cf-turnstile-response"]'
+                                );
                                 return el && el.value ? el.value : null;
                             }"""
                         )
@@ -921,6 +925,16 @@ class CheckIn:
         print(f"ℹ️ {self.account_name}: Trying check-in via site UI")
         status_func = self.provider_config.get_check_in_status_func()
 
+        def _checked() -> bool:
+            if not status_func:
+                return True
+            return status_func(
+                provider_config=self.provider_config,
+                account_config=self.account_config,
+                cookies=session.cookies.get_dict(),
+                headers=headers,
+            )
+
         with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_ui_") as tmp_dir:
             async with AsyncCamoufox(
                 user_data_dir=tmp_dir,
@@ -935,34 +949,40 @@ class CheckIn:
                 page = await browser.new_page()
                 try:
                     await page.context.add_cookies(site_cookies)
-                    await page.goto(
-                        f"{self.provider_config.origin}/dashboard/overview",
-                        wait_until="domcontentloaded",
-                    )
-                    await page.wait_for_timeout(6000)
-
-                    # 查找签到按钮（多语言匹配）
-                    button = page.get_by_role("button", name=re.compile(r"立即签到|Check in now", re.I))
-                    if (await button.count()) < 1:
-                        print(f"⚠️ {self.account_name}: Check-in button not found on dashboard")
+                    clicked = False
+                    # 依次尝试可能的签到页面路径
+                    for path in ("/dashboard/overview", "/dashboard/profile"):
+                        await page.goto(f"{self.provider_config.origin}{path}", wait_until="domcontentloaded")
+                        await page.wait_for_timeout(6000)
+                        button = page.get_by_role("button", name=re.compile(r"立即签到|Check in now", re.I))
+                        if (await button.count()) >= 1:
+                            await button.first.click()
+                            clicked = True
+                            print(f"ℹ️ {self.account_name}: Clicked check-in button on {path}, waiting for result")
+                            break
+                        print(f"⚠️ {self.account_name}: Check-in button not found on {path}")
+                    if not clicked:
                         return False
-                    await button.first.click()
-                    print(f"ℹ️ {self.account_name}: Clicked check-in button, waiting for result")
 
-                    # 轮询状态接口确认签到成功（SPA 内部处理 Turnstile，可能需要较长时间）
-                    for _ in range(45):
+                    # 轮询状态接口确认签到成功；中途尝试用 ClickSolver 处理弹窗中的验证组件
+                    solver_used = False
+                    for i in range(45):
                         await page.wait_for_timeout(2000)
-                        if not status_func:
-                            return True
-                        checked = status_func(
-                            provider_config=self.provider_config,
-                            account_config=self.account_config,
-                            cookies=session.cookies.get_dict(),
-                            headers=headers,
-                        )
-                        if checked:
+                        if _checked():
                             print(f"✅ {self.account_name}: Check-in via site UI succeeded")
                             return True
+                        if i in (10, 11, 12) and not solver_used:
+                            # 弹窗中的 Turnstile 组件可能需要点击，交给 ClickSolver 处理
+                            solver_used = True
+                            try:
+                                async with ClickSolver(
+                                    framework=FrameworkType.CAMOUFOX, page=page, max_attempts=2, attempt_delay=3
+                                ) as solver:
+                                    await solver.solve_captcha(
+                                        captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE
+                                    )
+                            except Exception as solve_err:
+                                print(f"⚠️ {self.account_name}: Turnstile click solver: {str(solve_err)[:100]}")
                     return False
                 except Exception as e:
                     print(f"❌ {self.account_name}: Site UI check-in error: {e}")
