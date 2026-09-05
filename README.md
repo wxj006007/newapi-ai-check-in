@@ -277,6 +277,29 @@ Affs:
 
 ![输入 OTP](./assets/github-otp.png)
 
+#### 3.9 预置 GitHub 登录态（推荐，可跳过验证）
+
+GitHub 对数据中心 IP（GitHub Actions 运行器）的登录会强制要求两步验证/设备验证，
+无人值守的定时任务很难自动通过。更稳妥的做法是在本地一次性生成各 GitHub 账号的
+登录态（storage state），通过仓库 Secret `STORATE_STATES_GITHUB` 注入：
+
+1. 本地运行（浏览器窗口会弹出，如遇 2FA / 设备验证请手动完成）：
+
+   ```bash
+   uv run python gen_github_storage_state.py            # 处理全部账号
+   uv run python gen_github_storage_state.py 用户名      # 只处理指定账号
+   ```
+
+2. 脚本会把成功登录的账号汇总写入 `STORATE_STATES_GITHUB.local.json`，
+   将其完整内容（JSON）配置为仓库的 Actions Secret `STORATE_STATES_GITHUB`：
+
+   ```json
+   { "github用户名": { "cookies": [...], "origins": [...] }, ... }
+   ```
+
+3. CI 会优先使用 secret 中的登录态（覆盖本地缓存），直接进入 OAuth 授权，
+   不再触发 GitHub 登录验证。GitHub 会话失效后重新生成一次即可。
+
 ### 4. 启用 GitHub Actions
 
 1. 在你的仓库中，点击 "Actions" 选项卡
