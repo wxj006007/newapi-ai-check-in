@@ -92,24 +92,6 @@ class GitHubSignIn:
 
             context = await browser.new_context(storage_state=storage_state)
 
-            # 拦截 OAuth 回调页面：新版 new-api 的 flow token 一次性有效，
-            # 站点前端回调页会先兑换 code 导致脚本无法再调用回调接口，
-            # 这里用本地 stub 响应代替真实页面，把 code/state 留给脚本自身
-            callback_pattern = self.provider_config.get_github_auth_redirect_pattern()
-            callback_captured = {"hit": False, "url": ""}
-
-            async def _fulfill_callback(route):
-                callback_captured["hit"] = True
-                callback_captured["url"] = route.request.url
-                await route.fulfill(
-                    status=200,
-                    content_type="text/html",
-                    body="<html><body>OAuth callback captured by check-in script</body></html>",
-                )
-
-            await context.route(callback_pattern, _fulfill_callback)
-            print(f"ℹ️ {self.account_name}: Intercepting OAuth callback pages matching {callback_pattern}")
-
             # 设置从 auth_state 获取的 session cookies 到页面上下文
             if auth_cookies:
                 await context.add_cookies(auth_cookies)
@@ -118,6 +100,25 @@ class GitHubSignIn:
                 print(f"ℹ️ {self.account_name}: No auth cookies to set")
 
             page = await context.new_page()
+
+            # 监听新版 new-api 回调页前端调用的 OAuth 兑换接口响应：
+            # 响应体包含 access_token 与用户信息（data.user.id），直接捕获即可，
+            # 无需脚本自行重放 code（新版 flow token 一次性有效）
+            oauth_bundles = []
+
+            async def _on_response(response):
+                try:
+                    url = response.url
+                    if "/api/oauth/" not in url or "/api/oauth/state" in url:
+                        return
+                    if response.status != 200:
+                        return
+                    body = await response.json()
+                    oauth_bundles.append({"url": url, "body": body})
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
 
             async with ClickSolver(
                 framework=FrameworkType.CAMOUFOX, page=page, max_attempts=5, attempt_delay=3
@@ -308,9 +309,13 @@ class GitHubSignIn:
                     try:
                         # 使用配置的 OAuth 回调路径匹配模式
                         redirect_pattern = self.provider_config.get_github_auth_redirect_pattern()
-                        print(f"ℹ️ {self.account_name}: Waiting for OAuth callback to: {redirect_pattern}")
-                        await page.wait_for_url(redirect_pattern, timeout=30000)
-                        await page.wait_for_timeout(5000)
+                        if oauth_bundles:
+                            # 兑换响应已在回调页加载时捕获（缓存会话直接完成授权）
+                            print(f"ℹ️ {self.account_name}: OAuth callback already processed during sign-in check")
+                        else:
+                            print(f"ℹ️ {self.account_name}: Waiting for OAuth callback to: {redirect_pattern}")
+                            await page.wait_for_url(redirect_pattern, timeout=30000)
+                            await page.wait_for_timeout(2000)
 
                         # 检查是否在 Cloudflare 验证页面
                         page_title = await page.title()
@@ -342,22 +347,40 @@ class GitHubSignIn:
                     api_user = None
                     current_url = page.url
 
-                    if callback_captured["hit"]:
-                        # 回调页面被本地拦截（新版 new-api 的 flow token 一次性有效），
-                        # 站点前端不会执行，localStorage 中不会有 user，
-                        # 直接把 code/state 返回给上层调用回调接口
+                    # 新版 new-api：回调页前端会调用 /api/oauth/:provider 兑换 code，
+                    # 从监听到的响应中提取 access_token 与用户 id
+                    access_token = None
+                    for _ in range(6):
+                        for item in oauth_bundles:
+                            body = item.get("body") or {}
+                            if not body.get("success"):
+                                continue
+                            data = body.get("data") or {}
+                            token = data.get("access_token")
+                            if not token:
+                                continue
+                            oauth_user = data.get("user") if isinstance(data.get("user"), dict) else {}
+                            api_user = data.get("id") or oauth_user.get("id")
+                            access_token = token
+                            break
+                        if access_token and api_user:
+                            break
+                        if not oauth_bundles:
+                            await page.wait_for_timeout(2000)
+
+                    if access_token and api_user:
                         print(
-                            f"ℹ️ {self.account_name}: OAuth callback intercepted locally, "
-                            f"returning code/state: {callback_captured['url']}"
+                            f"✅ {self.account_name}: Captured OAuth bundle from callback "
+                            f"(api_user: {api_user})"
                         )
-                        callback_url = callback_captured["url"] or current_url
-                        parsed_url = urlparse(callback_url)
-                        query_params = parse_qs(parsed_url.query)
-                        if "code" in query_params:
-                            return True, query_params, None
-                        print(f"❌ {self.account_name}: Captured callback URL without code: {callback_url}")
-                        await take_screenshot(page, "github_oauth_callback_no_code", self.account_name)
-                        return False, {"error": "GitHub OAuth callback captured without code"}, None
+                        user_cookies = filter_cookies(await context.cookies(), self.provider_config.origin)
+                        return True, {"access_token": access_token, "api_user": api_user, "cookies": user_cookies}, None
+
+                    if oauth_bundles:
+                        print(
+                            f"⚠️ {self.account_name}: OAuth callback API responded but no valid bundle: "
+                            f"{json.dumps(oauth_bundles[-1].get('body', {}), ensure_ascii=False)[:200]}"
+                        )
 
                     try:
                         try:

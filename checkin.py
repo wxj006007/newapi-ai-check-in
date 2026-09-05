@@ -1446,7 +1446,21 @@ class CheckIn:
             )
 
             # 检查是否成功获取 cookies 和 api_user
-            if success and "cookies" in result_data and "api_user" in result_data:
+            if success and result_data.get("access_token") and result_data.get("api_user") is not None:
+                # 新版 new-api：浏览器内 OAuth 兑换成功，直接使用 access_token 签到
+                api_user = result_data["api_user"]
+                access_token = result_data["access_token"]
+
+                # 如果 OAuth 登录返回了 browser_headers，用它更新 common_headers
+                updated_headers = common_headers.copy()
+                if oauth_browser_headers:
+                    print(f"ℹ️ {self.account_name}: Updating headers with OAuth browser fingerprint")
+                    updated_headers.update(oauth_browser_headers)
+
+                return await self.check_in_with_system_access_token(
+                    access_token, bypass_cookies, updated_headers, api_user
+                )
+            elif success and "cookies" in result_data and "api_user" in result_data:
                 # 统一调用 check_in_with_cookies 执行签到
                 user_cookies = result_data["cookies"]
                 api_user = result_data["api_user"]

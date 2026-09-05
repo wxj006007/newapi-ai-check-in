@@ -26,3 +26,5 @@ opencode.json
 
 # Git Worktree
 .worktree/
+STORATE_STATES_GITHUB.local.json
+secret-json-generator.local.html
